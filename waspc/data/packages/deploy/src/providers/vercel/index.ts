@@ -3,10 +3,28 @@ import { $ } from "zx";
 
 import { WaspProjectDir } from "../../common/brandedTypes.js";
 import { runVercelPreflightChecks } from "./preflight.js";
+import { setup as setupFn } from "./setup.js";
 
 class VercelCommand extends Command {
   addProjectNameArgument(): this {
     return this.argument("<project-name>", "project name to use on Vercel");
+  }
+  addServerSecretsOption(): this {
+    function collect(value: string, previous: string[]) {
+      return previous.concat([value]);
+    }
+    return this.option(
+      "--server-secret <serverSecret>",
+      "secret to set on the server app (of form FOO=BAR)",
+      collect,
+      [],
+    );
+  }
+  addAuthOptions(): this {
+    return this.option(
+      "--token <token>",
+      "Vercel access token (defaults to the logged-in Vercel CLI session)",
+    ).option("--scope <scope>", "Vercel team (slug or ID) to operate in");
   }
 }
 
@@ -60,17 +78,23 @@ export function createVercelCommand(): Command {
         runVercelPreflightChecks(waspProjectDir as WaspProjectDir);
       })
       .hook("preAction", async (cmd) => {
-        const { vercelExe } = cmd.opts<{ vercelExe: string }>();
-        await ensureVercelCliReady(vercelExe);
+        const { vercelExe, token } = cmd.opts<{
+          vercelExe: string;
+          token?: string;
+        }>();
+        await ensureVercelCliReady(vercelExe, token);
       });
   });
 
   return vercel;
 }
 
-async function ensureVercelCliReady(vercelExe: string): Promise<void> {
+async function ensureVercelCliReady(
+  vercelExe: string,
+  token?: string,
+): Promise<void> {
   await ensureVercelCliInstalled(vercelExe);
-  await ensureUserLoggedIn(vercelExe);
+  await ensureUserLoggedIn(vercelExe, token);
 }
 
 async function ensureVercelCliInstalled(vercelExe: string): Promise<void> {
@@ -85,14 +109,20 @@ async function ensureVercelCliInstalled(vercelExe: string): Promise<void> {
   }
 }
 
-async function ensureUserLoggedIn(vercelExe: string): Promise<void> {
-  const result = await $({ nothrow: true })`${vercelExe} whoami`;
+async function ensureUserLoggedIn(
+  vercelExe: string,
+  token?: string,
+): Promise<void> {
+  const tokenArgs = token ? ["--token", token] : [];
+  const result = await $({ nothrow: true })`${vercelExe} whoami ${tokenArgs}`;
   if (result.exitCode !== 0) {
     throw new Error(
-      [
-        "You are not logged in to the Vercel CLI.",
-        `Log in with \`${vercelExe} login\` (or provide a token via the VERCEL_TOKEN env var) and try again.`,
-      ].join("\n"),
+      token
+        ? "Vercel did not accept the provided --token. Double check the token and its team access."
+        : [
+            "You are not logged in to the Vercel CLI.",
+            `Log in with \`${vercelExe} login\` (or pass an access token via --token) and try again.`,
+          ].join("\n"),
     );
   }
 }
@@ -101,11 +131,22 @@ function makeVercelSetupCommand(): Command {
   return new VercelCommand("setup")
     .description("Configure a new app on Vercel")
     .addProjectNameArgument()
-    .action(() => {
-      throw new Error(
-        "`wasp deploy vercel setup` is not implemented yet. Nothing was changed on Vercel.",
-      );
-    });
+    .addServerSecretsOption()
+    .addAuthOptions()
+    .option(
+      "--db <db>",
+      'managed database to provision via the Vercel Marketplace (only "neon" is supported)',
+      "neon",
+    )
+    .option(
+      "--database-url <url>",
+      "skip database provisioning and use this connection string as DATABASE_URL",
+    )
+    .option(
+      "--direct-url <url>",
+      "non-pooled connection string for DIRECT_URL (only with --database-url; defaults to the --database-url value)",
+    )
+    .action((...args: Parameters<typeof setupFn>) => setupFn(...args));
 }
 
 function makeVercelDeployCommand(): Command {
