@@ -52,10 +52,12 @@ export function createVercelCli(options: VercelCliOptions): VercelCli {
 
 class ZxVercelCli implements VercelCli {
   private readonly vercelExe: string;
+  private readonly token?: string;
   private readonly authArgs: string[];
 
   constructor({ vercelExe, token, scope }: VercelCliOptions) {
     this.vercelExe = vercelExe;
+    this.token = token;
     this.authArgs = [
       ...(token ? ["--token", token] : []),
       ...(scope ? ["--scope", scope] : []),
@@ -91,7 +93,12 @@ class ZxVercelCli implements VercelCli {
   ): Promise<void> {
     // `--force` overwrites an existing variable for the same target, which
     // keeps re-runs of `setup` idempotent. The value is piped via stdin so
-    // it never shows up in argv or logs.
+    // it never shows up in argv or logs. `--no-sensitive` keeps the
+    // behavior deterministic: when the Vercel CLI detects an agent (or any
+    // non-interactive run) it otherwise defaults production env vars to
+    // "sensitive", whose values are write-only and would break both
+    // troubleshooting and this provider's own DATABASE_URL_UNPOOLED ->
+    // DIRECT_URL mapping via `env pull`.
     await this.runVercelCommand(
       [
         "env",
@@ -99,6 +106,7 @@ class ZxVercelCli implements VercelCli {
         name,
         environment,
         "--force",
+        "--no-sensitive",
         ...["--cwd", linkedProjectDir],
       ],
       { input: value, quiet: true },
@@ -207,15 +215,33 @@ class ZxVercelCli implements VercelCli {
     };
   }
 
-  private runVercelCommand(
+  private async runVercelCommand(
     commandArgs: string[],
     options: { nothrow?: boolean; quiet?: boolean; input?: string } = {},
   ) {
-    return $({
-      nothrow: options.nothrow ?? false,
-      quiet: options.quiet ?? false,
+    // Always run quiet: this package sets zx's global `$.verbose = true`,
+    // which would otherwise echo the full argv - including the `--token`
+    // value - into the terminal/logs. Failures are rethrown below with the
+    // token masked for the same reason.
+    const result = await $({
+      nothrow: true,
+      quiet: true,
       ...(options.input !== undefined ? { input: options.input } : {}),
     })`${this.vercelExe} ${[...commandArgs, ...this.authArgs]}`;
+    if (result.exitCode !== 0 && !(options.nothrow ?? false)) {
+      throw new Error(
+        [
+          `Vercel CLI command failed: ${this.vercelExe} ${this.maskToken(commandArgs.join(" "))}`,
+          this.maskToken(`${result.stdout}\n${result.stderr}`.trim()),
+        ].join("\n"),
+      );
+    }
+    return result;
+  }
+
+  private maskToken(text: string): string {
+    // (`split().join()` instead of `replaceAll` - tsconfig targets es2020.)
+    return this.token ? text.split(this.token).join("<token>") : text;
   }
 }
 

@@ -98,7 +98,7 @@ async function ensureVercelCliReady(
 }
 
 async function ensureVercelCliInstalled(vercelExe: string): Promise<void> {
-  const result = await $({ nothrow: true })`${vercelExe} --version`;
+  const result = await $({ nothrow: true, quiet: true })`${vercelExe} --version`;
   if (result.exitCode !== 0) {
     throw new Error(
       [
@@ -114,7 +114,12 @@ async function ensureUserLoggedIn(
   token?: string,
 ): Promise<void> {
   const tokenArgs = token ? ["--token", token] : [];
-  const result = await $({ nothrow: true })`${vercelExe} whoami ${tokenArgs}`;
+  // quiet: zx's global verbose mode would otherwise echo the argv,
+  // including the --token value, into the terminal/logs.
+  const result = await $({
+    nothrow: true,
+    quiet: true,
+  })`${vercelExe} whoami ${tokenArgs}`;
   if (result.exitCode !== 0) {
     throw new Error(
       token

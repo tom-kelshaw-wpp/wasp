@@ -7,7 +7,10 @@ import {
   WaspCliExe,
   WaspProjectDir,
 } from "../../../src/common/brandedTypes.js";
-import { VercelCli } from "../../../src/providers/vercel/VercelCli.js";
+import {
+  parseEnvFile,
+  VercelCli,
+} from "../../../src/providers/vercel/VercelCli.js";
 import {
   appUsesAuth,
   assertVercelAppNameIsValid,
@@ -230,6 +233,26 @@ describe("appUsesAuth", () => {
 
   test("returns false when no Wasp entry file exists", () => {
     expect(appUsesAuth(fixturesDir as WaspProjectDir)).toBe(false);
+  });
+});
+
+describe("parseEnvFile", () => {
+  test("parses the dotenv format `vercel env pull` writes", () => {
+    const contents = [
+      "# Created by Vercel CLI",
+      'DATABASE_URL="postgresql://u:p@ep-x-pooler.aws.neon.tech/db?sslmode=require"',
+      'DATABASE_URL_UNPOOLED="postgresql://u:p@ep-x.aws.neon.tech/db?sslmode=require"',
+      "PLAIN=unquoted-value",
+      "",
+      "not a valid line",
+    ].join("\n");
+    expect(parseEnvFile(contents)).toEqual({
+      DATABASE_URL:
+        "postgresql://u:p@ep-x-pooler.aws.neon.tech/db?sslmode=require",
+      DATABASE_URL_UNPOOLED:
+        "postgresql://u:p@ep-x.aws.neon.tech/db?sslmode=require",
+      PLAIN: "unquoted-value",
+    });
   });
 });
 
