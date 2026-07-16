@@ -2,8 +2,10 @@ import { Command, Option } from "commander";
 import { $ } from "zx";
 
 import { WaspProjectDir } from "../../common/brandedTypes.js";
+import { waspSays } from "../../common/terminal.js";
+import { deploy as deployFn } from "./deploy.js";
 import { runVercelPreflightChecks } from "./preflight.js";
-import { setup as setupFn } from "./setup.js";
+import { setup as setupFn, VercelSetupCmdOptions } from "./setup.js";
 
 class VercelCommand extends Command {
   addProjectNameArgument(): this {
@@ -25,6 +27,21 @@ class VercelCommand extends Command {
       "--token <token>",
       "Vercel access token (defaults to the logged-in Vercel CLI session)",
     ).option("--scope <scope>", "Vercel team (slug or ID) to operate in");
+  }
+  addDatabaseOptions(): this {
+    return this.option(
+      "--db <db>",
+      'managed database to provision via the Vercel Marketplace (only "neon" is supported)',
+      "neon",
+    )
+      .option(
+        "--database-url <url>",
+        "skip database provisioning and use this connection string as DATABASE_URL",
+      )
+      .option(
+        "--direct-url <url>",
+        "non-pooled connection string for DIRECT_URL (only with --database-url; defaults to the --database-url value)",
+      );
   }
 }
 
@@ -138,19 +155,7 @@ function makeVercelSetupCommand(): Command {
     .addProjectNameArgument()
     .addServerSecretsOption()
     .addAuthOptions()
-    .option(
-      "--db <db>",
-      'managed database to provision via the Vercel Marketplace (only "neon" is supported)',
-      "neon",
-    )
-    .option(
-      "--database-url <url>",
-      "skip database provisioning and use this connection string as DATABASE_URL",
-    )
-    .option(
-      "--direct-url <url>",
-      "non-pooled connection string for DIRECT_URL (only with --database-url; defaults to the --database-url value)",
-    )
+    .addDatabaseOptions()
     .action((...args: Parameters<typeof setupFn>) => setupFn(...args));
 }
 
@@ -158,20 +163,28 @@ function makeVercelDeployCommand(): Command {
   return new VercelCommand("deploy")
     .description("Deploys the app to Vercel")
     .addProjectNameArgument()
-    .action(() => {
-      throw new Error(
-        "`wasp deploy vercel deploy` is not implemented yet. Nothing was deployed to Vercel.",
-      );
-    });
+    .addAuthOptions()
+    .action((...args: Parameters<typeof deployFn>) => deployFn(...args));
 }
 
 function makeVercelLaunchCommand(): Command {
   return new VercelCommand("launch")
     .description("Launch a new app on Vercel (calls setup and deploy)")
     .addProjectNameArgument()
-    .action(() => {
-      throw new Error(
-        "`wasp deploy vercel launch` is not implemented yet. Nothing was changed on Vercel.",
-      );
-    });
+    .addServerSecretsOption()
+    .addAuthOptions()
+    .addDatabaseOptions()
+    .action((...args: Parameters<typeof launchFn>) => launchFn(...args));
+}
+
+// Launch is setup followed by deploy (mirroring the Railway provider's
+// launch composition): its options are setup's options, which are a
+// superset of deploy's.
+async function launchFn(
+  appName: string,
+  options: VercelSetupCmdOptions,
+): Promise<void> {
+  waspSays("Launching your Wasp app to Vercel!");
+  await setupFn(appName, options);
+  await deployFn(appName, options);
 }

@@ -38,6 +38,7 @@ export interface VercelCli {
     projectName: string;
     linkedProjectDir: string;
   }): Promise<{ success: boolean; output: string }>;
+  deployToProd(linkedProjectDir: string): Promise<string>;
 }
 
 export interface VercelCliOptions {
@@ -213,6 +214,20 @@ class ZxVercelCli implements VercelCli {
       success: result.exitCode === 0,
       output: `${result.stdout}\n${result.stderr}`.trim(),
     };
+  }
+
+  async deployToProd(linkedProjectDir: string): Promise<string> {
+    // Creates a new production deployment for the project linked to
+    // `linkedProjectDir`. Non-interactive (`--yes`); the deployment URL is
+    // what the CLI prints to stdout. Like every other command here it runs
+    // quiet so the token never leaks through zx's verbose argv echo.
+    const result = await this.runVercelCommand([
+      "deploy",
+      "--prod",
+      "--yes",
+      ...["--cwd", linkedProjectDir],
+    ]);
+    return result.stdout.trim();
   }
 
   private async runVercelCommand(

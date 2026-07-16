@@ -8,6 +8,7 @@ import { createVercelCommand } from "../../../src/providers/vercel/index.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(__dirname, "fixtures");
 const stubVercelCliPath = path.join(fixturesDir, "stubVercelCli.sh");
+const stubFailingWaspCliPath = path.join(fixturesDir, "stubFailingWaspCli.sh");
 
 // createVercelCommand() mutates module-level singleton subcommands
 // (vercelSetupCommand/vercelDeployCommand/vercelLaunchCommand from
@@ -58,7 +59,31 @@ describe("createVercelCommand", () => {
       expect(option).toBeDefined();
       expect(option?.defaultValue).toBe("vercel");
     });
+
+    test("accepts --token and --scope auth options", () => {
+      const longFlags = subcommand?.options.map((opt) => opt.long);
+      expect(longFlags).toContain("--token");
+      expect(longFlags).toContain("--scope");
+    });
   });
+
+  describe.each(["setup", "launch"])(
+    "%s subcommand database options",
+    (name) => {
+      const subcommand = vercel.commands.find((cmd) => cmd.name() === name);
+
+      test("accepts --db defaulting to neon, plus the --database-url escape hatch", () => {
+        const longFlags = subcommand?.options.map((opt) => opt.long);
+        expect(longFlags).toContain("--db");
+        expect(longFlags).toContain("--database-url");
+        expect(longFlags).toContain("--direct-url");
+        const dbOption = subcommand?.options.find(
+          (opt) => opt.long === "--db",
+        );
+        expect(dbOption?.defaultValue).toBe("neon");
+      });
+    },
+  );
 });
 
 describe("preflight warnings wired into command run (task-16)", () => {
@@ -72,20 +97,21 @@ describe("preflight warnings wired into command run (task-16)", () => {
     warnSpy.mockRestore();
   });
 
-  // The deploy/launch subcommands' real actions are not implemented yet
-  // (task-15); they always reject with a "not implemented yet" error. That
-  // rejection is expected here and proves the preflight warning did NOT
-  // block the command: the preAction hook ran, printed its warning, and let
-  // the (currently unimplemented) action run next - warn-not-block.
+  // The deploy/launch subcommands' real actions (task-15) run here against
+  // stub CLIs: `wasp build` is a stub that always fails fast (deploy), and
+  // the neon integration check comes back empty (launch), so both commands
+  // reject after the preAction hooks ran. That rejection proves the
+  // preflight warning did NOT block the command: the hook ran, printed its
+  // warning, and let the real action run next - warn-not-block.
   describe.each(["deploy", "launch"])("%s subcommand", (name) => {
-    test("prints the job preflight warning before the not-implemented error", async () => {
+    test("prints the job preflight warning before the action's own failure", async () => {
       await expect(
         vercel.parseAsync(
           [
             name,
             "my-app",
             "--wasp-exe",
-            "wasp",
+            stubFailingWaspCliPath,
             "--wasp-project-dir",
             path.join(fixturesDir, "appWithJob"),
             "--vercel-exe",
@@ -93,7 +119,7 @@ describe("preflight warnings wired into command run (task-16)", () => {
           ],
           { from: "user" },
         ),
-      ).rejects.toThrow("not implemented yet");
+      ).rejects.toThrow();
 
       const printed = warnSpy.mock.calls
         .map((call) => call.join(" "))
@@ -109,7 +135,7 @@ describe("preflight warnings wired into command run (task-16)", () => {
             name,
             "my-app",
             "--wasp-exe",
-            "wasp",
+            stubFailingWaspCliPath,
             "--wasp-project-dir",
             path.join(fixturesDir, "appWithNeither"),
             "--vercel-exe",
@@ -117,7 +143,7 @@ describe("preflight warnings wired into command run (task-16)", () => {
           ],
           { from: "user" },
         ),
-      ).rejects.toThrow("not implemented yet");
+      ).rejects.toThrow();
 
       expect(warnSpy).not.toHaveBeenCalled();
     });

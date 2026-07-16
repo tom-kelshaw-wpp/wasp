@@ -129,6 +129,10 @@ class FakeVercelCli implements VercelCli {
     return this.connectIntegrationResourceResult;
   }
 
+  async deployToProd(_linkedProjectDir: string): Promise<string> {
+    throw new Error("setup must never deploy (deploy's job)");
+  }
+
   getLinkedProject(dir: string): string {
     const projectName = this.linkedDirs.get(dir);
     if (projectName === undefined) {

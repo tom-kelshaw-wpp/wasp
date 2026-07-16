@@ -5,8 +5,25 @@ import path from "node:path";
 import { WaspCliExe, WaspProjectDir } from "../../common/brandedTypes.js";
 import { generateRandomHexString } from "../../common/random.js";
 import { waspSays } from "../../common/terminal.js";
+import {
+  assertVercelAppNameIsValid,
+  getClientAppUrl,
+  getClientProjectName,
+  getServerAppUrl,
+  getServerProjectName,
+} from "./brandedUrls.js";
 import { findWaspEntryFile } from "./preflight.js";
 import { createVercelCli, VercelCli } from "./VercelCli.js";
+
+// Re-exported for backwards compatibility: these helpers used to live here
+// before task-15 moved them into brandedUrls.ts.
+export {
+  assertVercelAppNameIsValid,
+  getClientAppUrl,
+  getClientProjectName,
+  getServerAppUrl,
+  getServerProjectName,
+};
 
 export interface VercelSetupCmdOptions {
   waspExe: WaspCliExe;
@@ -22,48 +39,6 @@ export interface VercelSetupCmdOptions {
 
 const NEON_INTEGRATION_SLUG = "neon";
 const PRODUCTION_ENVIRONMENT = "production";
-
-// Vercel project names: lowercase alphanumerics plus ".", "_", "-", up to
-// 100 chars. We reserve room for the longest suffix we append ("-server").
-const VALID_APP_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
-const MAX_APP_NAME_LENGTH = 90;
-
-export function getServerProjectName(appName: string): string {
-  return `${appName}-server`;
-}
-
-export function getClientProjectName(appName: string): string {
-  return `${appName}-client`;
-}
-
-// Deterministic production URLs derived from the project names. Knowing
-// both URLs before either deploy runs is what solves the client<->server
-// chicken-and-egg problem (same trick as the Railway provider).
-export function getServerAppUrl(appName: string): string {
-  return `https://${getServerProjectName(appName)}.vercel.app`;
-}
-
-export function getClientAppUrl(appName: string): string {
-  return `https://${getClientProjectName(appName)}.vercel.app`;
-}
-
-export function assertVercelAppNameIsValid(appName: string): void {
-  if (!VALID_APP_NAME_RE.test(appName)) {
-    throw new Error(
-      [
-        `Invalid app name: "${appName}".`,
-        "Vercel project names must start with a lowercase letter or digit and",
-        'may only contain lowercase letters, digits, ".", "_" and "-".',
-      ].join(" "),
-    );
-  }
-  if (appName.length > MAX_APP_NAME_LENGTH) {
-    throw new Error(
-      `App name too long: must be at most ${MAX_APP_NAME_LENGTH} characters ` +
-        `(so the "-server"/"-client" suffixes fit Vercel's limit).`,
-    );
-  }
-}
 
 export interface ServerSecret {
   name: string;
