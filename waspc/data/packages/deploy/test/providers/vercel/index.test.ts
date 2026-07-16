@@ -72,12 +72,12 @@ describe("preflight warnings wired into command run (task-16)", () => {
     warnSpy.mockRestore();
   });
 
-  // These subcommands' real actions are not implemented yet (task-14/15);
-  // they always reject with a "not implemented yet" error. That rejection
-  // is expected here and proves the preflight warning did NOT block the
-  // command: the preAction hook ran, printed its warning, and let the
-  // (currently unimplemented) action run next - warn-not-block.
-  describe.each(["setup", "deploy", "launch"])("%s subcommand", (name) => {
+  // The deploy/launch subcommands' real actions are not implemented yet
+  // (task-15); they always reject with a "not implemented yet" error. That
+  // rejection is expected here and proves the preflight warning did NOT
+  // block the command: the preAction hook ran, printed its warning, and let
+  // the (currently unimplemented) action run next - warn-not-block.
+  describe.each(["deploy", "launch"])("%s subcommand", (name) => {
     test("prints the job preflight warning before the not-implemented error", async () => {
       await expect(
         vercel.parseAsync(
@@ -120,6 +120,38 @@ describe("preflight warnings wired into command run (task-16)", () => {
       ).rejects.toThrow("not implemented yet");
 
       expect(warnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // The setup subcommand has a real action (task-14). Run it against the
+  // stub Vercel CLI (every call exits 0) with the --database-url escape
+  // hatch: it must print the preflight warning and then complete without
+  // throwing - warn-not-block, end to end.
+  describe("setup subcommand (real action, task-14)", () => {
+    test("prints the job preflight warning and still completes", async () => {
+      await expect(
+        vercel.parseAsync(
+          [
+            "setup",
+            "my-app",
+            "--wasp-exe",
+            "wasp",
+            "--wasp-project-dir",
+            path.join(fixturesDir, "appWithJob"),
+            "--vercel-exe",
+            stubVercelCliPath,
+            "--database-url",
+            "postgresql://user:pass@db.example.com:5432/mydb",
+          ],
+          { from: "user" },
+        ),
+      ).resolves.toBeDefined();
+
+      const printed = warnSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
+      expect(printed).toContain("sendEmailJob");
+      expect(printed).toContain("Vercel Cron");
     });
   });
 });
