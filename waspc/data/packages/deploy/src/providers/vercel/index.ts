@@ -1,6 +1,9 @@
 import { Command, Option } from "commander";
 import { $ } from "zx";
 
+import { WaspProjectDir } from "../../common/brandedTypes.js";
+import { runVercelPreflightChecks } from "./preflight.js";
+
 class VercelCommand extends Command {
   addProjectNameArgument(): this {
     return this.argument("<project-name>", "project name to use on Vercel");
@@ -49,6 +52,13 @@ export function createVercelCommand(): Command {
           .hideHelp()
           .default("vercel"),
       )
+      .hook("preAction", (cmd) => {
+        const { waspProjectDir } = cmd.opts<{ waspProjectDir: string }>();
+        // Preflight (task-16): warn-not-block detection of Wasp project
+        // features (pg-boss jobs, WebSockets) known to behave badly on
+        // Vercel. This never throws and never blocks the command below.
+        runVercelPreflightChecks(waspProjectDir as WaspProjectDir);
+      })
       .hook("preAction", async (cmd) => {
         const { vercelExe } = cmd.opts<{ vercelExe: string }>();
         await ensureVercelCliReady(vercelExe);
