@@ -14,12 +14,11 @@ import {
   getServerBuildArtefactsDir,
 } from "../../../src/common/waspProject.js";
 import {
+  createServerDeployStagingDir,
   DeployBoundary,
   makeClientVercelJsonContents,
   makeServerVercelJsonContents,
-  patchPackageJsonWorkspacesForVercel,
   patchPrismaSchemaForVercel,
-  prepareServerDeployDir,
   runDeploy,
   SERVER_BUILD_COMMAND,
   SERVER_ENTRYPOINT_SHIM,
@@ -70,8 +69,9 @@ describe("server entrypoint shim", () => {
     expect(lines).toHaveLength(2);
     // Inert marker so Vercel's content-based Express detection engages.
     expect(lines[0]).toContain("import express from 'express'");
-    // Loads the rollup-bundled, unmodified Wasp server.
-    expect(lines[1]).toBe("import './server/bundle/server.js'");
+    // Loads the rollup-bundled, unmodified Wasp server from the mirrored
+    // Docker layout (build output nested under .wasp/out/).
+    expect(lines[1]).toBe("import './.wasp/out/server/bundle/server.js'");
   });
 
   test("never inspects user code (contains no placeholders)", () => {
@@ -102,6 +102,10 @@ describe("server vercel.json generation", () => {
     expect(generateIdx).toBeGreaterThanOrEqual(0);
     expect(migrateIdx).toBeGreaterThan(generateIdx);
     expect(rollupIdx).toBeGreaterThan(migrateIdx);
+  });
+
+  test("buildCommand runs inside the nested build-output dir of the mirrored layout", () => {
+    expect(parsed.buildCommand.startsWith("cd .wasp/out && ")).toBe(true);
   });
 
   test("build steps address the generated schema explicitly", () => {
@@ -174,39 +178,32 @@ describe("patchPrismaSchemaForVercel", () => {
   });
 });
 
-describe("patchPackageJsonWorkspacesForVercel", () => {
-  test("rewrites the Docker-layout workspaces globs to the deploy-root layout", () => {
-    const patched = JSON.parse(
-      patchPackageJsonWorkspacesForVercel(PRISTINE_PACKAGE_JSON),
-    );
-    expect(patched.workspaces).toEqual(["server", "sdk/wasp"]);
-  });
-
-  test("preserves all other package.json fields", () => {
-    const patched = JSON.parse(
-      patchPackageJsonWorkspacesForVercel(PRISTINE_PACKAGE_JSON),
-    );
-    expect(patched.name).toBe("testapp");
-    expect(patched.type).toBe("module");
-  });
-
-  test("is idempotent", () => {
-    const once = patchPackageJsonWorkspacesForVercel(PRISTINE_PACKAGE_JSON);
-    expect(patchPackageJsonWorkspacesForVercel(once)).toBe(once);
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Filesystem-level tests (temp dirs standing in for a `wasp build` output).
 // ---------------------------------------------------------------------------
 
 let tempWaspProjectDir: WaspProjectDir;
 
+// Mirrors the Wasp 0.22 build output layout that the generated Dockerfile
+// consumes: user code copy in src/, root package.json + tsconfig.json, and
+// the framework dirs (server/, sdk/, libs/, db/).
 function makeFakeWaspBuildOutput(): string {
   const outDir = getServerBuildArtefactsDir(tempWaspProjectDir);
   fs.mkdirSync(path.join(outDir, "db"), { recursive: true });
   fs.writeFileSync(path.join(outDir, "db", "schema.prisma"), PRISTINE_SCHEMA);
   fs.writeFileSync(path.join(outDir, "package.json"), PRISTINE_PACKAGE_JSON);
+  fs.writeFileSync(path.join(outDir, "package-lock.json"), "{}");
+  fs.writeFileSync(path.join(outDir, "tsconfig.json"), "{}");
+  fs.mkdirSync(path.join(outDir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(outDir, "src", "apis.ts"), "export const x = 1;");
+  fs.mkdirSync(path.join(outDir, "server", "node_modules", "junk"), {
+    recursive: true,
+  });
+  fs.writeFileSync(path.join(outDir, "server", "package.json"), "{}");
+  fs.mkdirSync(path.join(outDir, "sdk", "wasp"), { recursive: true });
+  fs.writeFileSync(path.join(outDir, "sdk", "wasp", "package.json"), "{}");
+  fs.mkdirSync(path.join(outDir, "libs"), { recursive: true });
+  fs.writeFileSync(path.join(outDir, "libs", "some-lib.tgz"), "");
   return outDir;
 }
 
@@ -261,27 +258,91 @@ describe("getClientSpaFallbackFileName", () => {
   });
 });
 
-describe("prepareServerDeployDir", () => {
-  test("writes the entrypoint shim, vercel.json, and patches schema + workspaces", () => {
-    const outDir = makeFakeWaspBuildOutput();
-    prepareServerDeployDir(outDir);
+describe("createServerDeployStagingDir", () => {
+  let stagingDir: string;
 
-    expect(fs.readFileSync(path.join(outDir, "server.js"), "utf-8")).toBe(
+  afterEach(() => {
+    if (stagingDir !== undefined) {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
+  });
+
+  test("mirrors the Docker layout the generated relative imports expect", () => {
+    // Framework code in .wasp/out/server imports user code via relative
+    // paths that assume the project layout (src/ at the root, framework
+    // dirs nested under .wasp/out/) - same reason the generated Dockerfile
+    // mirrors this structure.
+    stagingDir = createServerDeployStagingDir(makeFakeWaspBuildOutput());
+
+    expect(fs.existsSync(path.join(stagingDir, "src", "apis.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(stagingDir, "package.json"))).toBe(true);
+    expect(fs.existsSync(path.join(stagingDir, "package-lock.json"))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(stagingDir, "tsconfig.json"))).toBe(true);
+    for (const dir of ["server", "sdk", "libs", "db"]) {
+      expect(
+        fs.existsSync(path.join(stagingDir, ".wasp", "out", dir)),
+      ).toBe(true);
+    }
+  });
+
+  test("keeps the generated package.json (workspaces globs) verbatim", () => {
+    stagingDir = createServerDeployStagingDir(makeFakeWaspBuildOutput());
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(stagingDir, "package.json"), "utf-8"),
+    );
+    // The generated globs are relative to the mirrored layout root, exactly
+    // like in the Docker image - no rewrite needed or wanted.
+    expect(packageJson.workspaces).toEqual([
+      ".wasp/out/*",
+      ".wasp/out/sdk/wasp",
+    ]);
+  });
+
+  test("writes the entrypoint shim and vercel.json at the staging root", () => {
+    stagingDir = createServerDeployStagingDir(makeFakeWaspBuildOutput());
+    expect(fs.readFileSync(path.join(stagingDir, "server.js"), "utf-8")).toBe(
       SERVER_ENTRYPOINT_SHIM,
     );
-    expect(fs.readFileSync(path.join(outDir, "vercel.json"), "utf-8")).toBe(
-      makeServerVercelJsonContents(),
-    );
+    expect(
+      fs.readFileSync(path.join(stagingDir, "vercel.json"), "utf-8"),
+    ).toBe(makeServerVercelJsonContents());
+  });
+
+  test("patches the staged Prisma schema (binaryTargets + directUrl)", () => {
+    stagingDir = createServerDeployStagingDir(makeFakeWaspBuildOutput());
     const schema = fs.readFileSync(
-      path.join(outDir, "db", "schema.prisma"),
+      path.join(stagingDir, ".wasp", "out", "db", "schema.prisma"),
       "utf-8",
     );
     expect(schema).toContain("rhel-openssl-3.0.x");
     expect(schema).toContain('directUrl = env("DIRECT_URL")');
-    const packageJson = JSON.parse(
-      fs.readFileSync(path.join(outDir, "package.json"), "utf-8"),
-    );
-    expect(packageJson.workspaces).toEqual(["server", "sdk/wasp"]);
+  });
+
+  test("leaves the original build output untouched", () => {
+    const outDir = makeFakeWaspBuildOutput();
+    stagingDir = createServerDeployStagingDir(outDir);
+    expect(
+      fs.readFileSync(path.join(outDir, "db", "schema.prisma"), "utf-8"),
+    ).toBe(PRISTINE_SCHEMA);
+    expect(fs.existsSync(path.join(outDir, "server.js"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "vercel.json"))).toBe(false);
+  });
+
+  test("does not copy node_modules into the staging dir", () => {
+    stagingDir = createServerDeployStagingDir(makeFakeWaspBuildOutput());
+    expect(
+      fs.existsSync(
+        path.join(stagingDir, ".wasp", "out", "server", "node_modules"),
+      ),
+    ).toBe(false);
+  });
+
+  test("throws a clear error when the build output looks incomplete", () => {
+    const outDir = makeFakeWaspBuildOutput();
+    fs.rmSync(path.join(outDir, "server"), { recursive: true });
+    expect(() => createServerDeployStagingDir(outDir)).toThrow(/server/);
   });
 });
 
@@ -295,6 +356,9 @@ class FakeVercelCli implements VercelCli {
   events: string[] = [];
   linkedDirs = new Map<string, string>(); // dir -> project name
   deployedDirs: string[] = [];
+  // Filenames present in each deployed dir, snapshotted at deploy time (the
+  // server staging dir is ephemeral - it is cleaned up right after deploy).
+  deployedDirFiles = new Map<string, string[]>(); // project name -> files
 
   async doesProjectExist(projectName: string): Promise<boolean> {
     return this.existingProjects.has(projectName);
@@ -311,6 +375,7 @@ class FakeVercelCli implements VercelCli {
       throw new Error(`deploy from unlinked dir: ${linkedProjectDir}`);
     }
     this.deployedDirs.push(path.normalize(linkedProjectDir));
+    this.deployedDirFiles.set(projectName, fs.readdirSync(linkedProjectDir));
     this.events.push(`deploy:${projectName}`);
     return `https://${projectName}-deadbeef.vercel.app`;
   }
@@ -394,30 +459,22 @@ describe("runDeploy", () => {
     ]);
   });
 
-  test("deploys the server from the wasp build output dir", async () => {
+  test("deploys the server from a staged dir carrying the shim, config and mirrored layout", async () => {
     const fake = makeFakeBoundary();
     await runDeploy(cli, "my-app", makeOptions(), fake.boundary);
-    expect(cli.deployedDirs[0]).toBe(
-      path.normalize(getServerBuildArtefactsDir(tempWaspProjectDir)),
-    );
+
+    const deployedServerFiles = cli.deployedDirFiles.get("my-app-server");
+    expect(deployedServerFiles).toContain("server.js");
+    expect(deployedServerFiles).toContain("vercel.json");
+    expect(deployedServerFiles).toContain("package.json");
+    expect(deployedServerFiles).toContain("src");
+    expect(deployedServerFiles).toContain(".wasp");
   });
 
-  test("prepares the server deploy dir (shim + vercel.json + patches) before deploying", async () => {
+  test("cleans the ephemeral server staging dir up after deploying", async () => {
     const fake = makeFakeBoundary();
     await runDeploy(cli, "my-app", makeOptions(), fake.boundary);
-
-    const outDir = getServerBuildArtefactsDir(tempWaspProjectDir);
-    expect(fs.readFileSync(path.join(outDir, "server.js"), "utf-8")).toBe(
-      SERVER_ENTRYPOINT_SHIM,
-    );
-    const vercelJson = JSON.parse(
-      fs.readFileSync(path.join(outDir, "vercel.json"), "utf-8"),
-    );
-    expect(vercelJson.framework).toBe("express");
-    expect(vercelJson.buildCommand).toBe(SERVER_BUILD_COMMAND);
-    expect(
-      fs.readFileSync(path.join(outDir, "db", "schema.prisma"), "utf-8"),
-    ).toContain('directUrl = env("DIRECT_URL")');
+    expect(fs.existsSync(cli.deployedDirs[0])).toBe(false);
   });
 
   test("builds the client with the predicted server URL, not a placeholder", async () => {

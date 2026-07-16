@@ -1,4 +1,5 @@
 import fs from "fs";
+import os from "node:os";
 import path from "node:path";
 
 import { WaspCliExe, WaspProjectDir } from "../../common/brandedTypes.js";
@@ -49,23 +50,30 @@ const defaultBoundary: DeployBoundary = {
 
 // ---------------------------------------------------------------------------
 // Server deploy artifacts (per docs/manual-recipe.md, verified in the m-1
-// experiments). The server path is Vercel's Express zero-config on Fluid
-// compute; the Wasp build output (`.wasp/out`) is the deploy root and every
-// artifact below must be re-applied on every deploy, because `wasp build`
-// wipes that directory each time.
+// experiments, plus one correction the recipe's test app could not surface).
+// The server path is Vercel's Express zero-config on Fluid compute.
+//
+// Deploy-root layout: the framework code in `.wasp/out/server` imports the
+// user's code with relative paths that assume the project layout (e.g.
+// `../../../../../../src/apis`, resolving to `<root>/src/...` only when the
+// build output sits nested under `<root>/.wasp/out/`). The generated
+// Dockerfile mirrors that structure for exactly this reason, and so do we:
+// the deploy root is an ephemeral staging dir shaped like the Docker image
+// (src/, package.json, tsconfig.json at the root; server/sdk/libs/db under
+// .wasp/out/), rebuilt from the Wasp build output on every deploy.
 // ---------------------------------------------------------------------------
 
 /**
  * Vercel's Express zero-config only scans app|index|server.{js,...} at the
- * deploy root, but Wasp's entry lives two directories below it. This fixed
- * 2-line shim bridges the gap: the express import is an inert marker for
- * Vercel's content-based framework detection, the second import loads the
+ * deploy root, but Wasp's entry lives far below it. This fixed 2-line shim
+ * bridges the gap: the express import is an inert marker for Vercel's
+ * content-based framework detection, the second import loads the
  * rollup-bundled, unmodified Wasp server (which does its normal
  * `http.createServer(app).listen(process.env.PORT)` startup).
  */
 export const SERVER_ENTRYPOINT_SHIM = [
   "import express from 'express' // eslint-disable-line no-unused-vars",
-  "import './server/bundle/server.js'",
+  "import './.wasp/out/server/bundle/server.js'",
   "",
 ].join("\n");
 
@@ -76,12 +84,12 @@ export const SERVER_ENTRYPOINT_SHIM = [
  * server with rollup directly.
  *
  * Deliberately NOT the generated `npm run bundle` script: its `tsc --build`
- * half dies under the flattened deploy root (server/tsconfig.json references
- * ../../../tsconfig.json, which resolves to the filesystem root).
+ * half needs project references and devDeps this deploy does not carry.
  * rollup-plugin-esbuild does its own TS transpilation; the output is
- * behaviorally identical.
+ * behaviorally identical (this is the recipe-verified chain).
  */
 export const SERVER_BUILD_COMMAND = [
+  "cd .wasp/out",
   "npx prisma generate --schema=db/schema.prisma",
   "DATABASE_URL=$DIRECT_URL npx prisma migrate deploy --schema=db/schema.prisma",
   "cd server && npm install && npx rollup --config --silent",
@@ -166,51 +174,91 @@ function upsertLineInPrismaBlock(
   return schemaContents.replace(block, () => patchedBlock);
 }
 
-/**
- * The generated `"workspaces"` globs assume the Docker `/app` layout. With
- * `.wasp/out` itself as the deploy root they must point at the sibling
- * dirs directly, or workspace linking silently fails and `wasp` /
- * `@wasp.sh/generated-server` do not resolve.
- */
-export function patchPackageJsonWorkspacesForVercel(
-  packageJsonContents: string,
-): string {
-  const packageJson = JSON.parse(packageJsonContents) as Record<
-    string,
-    unknown
-  >;
-  packageJson["workspaces"] = ["server", "sdk/wasp"];
-  return JSON.stringify(packageJson, null, 2);
-}
+// What the generated Dockerfile copies to the image root and to the nested
+// .wasp/out/ dir, respectively. The workspaces globs in the generated
+// package.json (".wasp/out/*", ".wasp/out/sdk/wasp") are relative to this
+// layout, so the file is staged verbatim - no rewrite.
+const STAGED_ROOT_DIRS = ["src"];
+const STAGED_ROOT_FILES = ["package.json", "package-lock.json", "tsconfig.json"];
+const STAGED_BUILD_OUTPUT_DIRS = ["server", "sdk", "libs", "db"];
+const REQUIRED_BUILD_OUTPUT_ENTRIES = ["server", "db", "package.json"];
 
 /**
- * Applies every server deploy artifact to the (freshly built) Wasp build
- * output dir. Idempotent, and re-run on every deploy - `wasp build` wipes
- * all of this away each time it runs.
+ * Builds the ephemeral server deploy root from the (freshly built) Wasp
+ * build output: the Docker-image layout mirrored onto disk, plus the Vercel
+ * artifacts (entrypoint shim, vercel.json, patched Prisma schema). Returns
+ * the staging dir; the caller deploys it and removes it afterwards. Rebuilt
+ * on every deploy - `wasp build` regenerates its inputs each time it runs.
  */
-export function prepareServerDeployDir(serverDeployDir: string): void {
-  const schemaPath = path.join(serverDeployDir, "db", "schema.prisma");
+export function createServerDeployStagingDir(
+  serverBuildArtefactsDir: string,
+): string {
+  for (const requiredEntry of REQUIRED_BUILD_OUTPUT_ENTRIES) {
+    if (!fs.existsSync(path.join(serverBuildArtefactsDir, requiredEntry))) {
+      throw new Error(
+        `The Wasp build output at ${serverBuildArtefactsDir} is missing "${requiredEntry}". Did \`wasp build\` succeed?`,
+      );
+    }
+  }
+
+  const stagingDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "wasp-vercel-server-deploy-"),
+  );
+
+  for (const dir of STAGED_ROOT_DIRS) {
+    copyIfExists(
+      path.join(serverBuildArtefactsDir, dir),
+      path.join(stagingDir, dir),
+    );
+  }
+  for (const file of STAGED_ROOT_FILES) {
+    copyIfExists(
+      path.join(serverBuildArtefactsDir, file),
+      path.join(stagingDir, file),
+    );
+  }
+  for (const dir of STAGED_BUILD_OUTPUT_DIRS) {
+    copyIfExists(
+      path.join(serverBuildArtefactsDir, dir),
+      path.join(stagingDir, ".wasp", "out", dir),
+    );
+  }
+
+  const schemaPath = path.join(
+    stagingDir,
+    ".wasp",
+    "out",
+    "db",
+    "schema.prisma",
+  );
   fs.writeFileSync(
     schemaPath,
     patchPrismaSchemaForVercel(fs.readFileSync(schemaPath, "utf-8")),
   );
 
-  const packageJsonPath = path.join(serverDeployDir, "package.json");
+  fs.writeFileSync(path.join(stagingDir, "server.js"), SERVER_ENTRYPOINT_SHIM);
   fs.writeFileSync(
-    packageJsonPath,
-    patchPackageJsonWorkspacesForVercel(
-      fs.readFileSync(packageJsonPath, "utf-8"),
-    ),
-  );
-
-  fs.writeFileSync(
-    path.join(serverDeployDir, "server.js"),
-    SERVER_ENTRYPOINT_SHIM,
-  );
-  fs.writeFileSync(
-    path.join(serverDeployDir, "vercel.json"),
+    path.join(stagingDir, "vercel.json"),
     makeServerVercelJsonContents(),
   );
+
+  return stagingDir;
+}
+
+function copyIfExists(source: string, destination: string): void {
+  if (!fs.existsSync(source)) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.cpSync(source, destination, {
+    recursive: true,
+    // node_modules are reinstalled remotely; .vercel would leak a stale
+    // project link into the upload.
+    filter: (src) => {
+      const baseName = path.basename(src);
+      return baseName !== "node_modules" && baseName !== ".vercel";
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -296,17 +344,21 @@ async function deployServer(
 ): Promise<void> {
   waspSays("Deploying your server now...");
 
-  const serverDeployDir = getServerBuildArtefactsDir(options.waspProjectDir);
-  prepareServerDeployDir(serverDeployDir);
-
-  // `wasp build` also wiped any previous `.vercel/` link, so re-link on
-  // every deploy.
-  await vercelCli.linkProjectToDir(serverProjectName, serverDeployDir);
-
-  waspSays(
-    "Creating the server deployment (Vercel builds it remotely - this can take a few minutes)...",
+  const serverBuildArtefactsDir = getServerBuildArtefactsDir(
+    options.waspProjectDir,
   );
-  await vercelCli.deployToProd(serverDeployDir);
+  const stagingDir = createServerDeployStagingDir(serverBuildArtefactsDir);
+  try {
+    // The staging dir is fresh on every deploy, so it always needs a link.
+    await vercelCli.linkProjectToDir(serverProjectName, stagingDir);
+
+    waspSays(
+      "Creating the server deployment (Vercel builds it remotely - this can take a few minutes)...",
+    );
+    await vercelCli.deployToProd(stagingDir);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+  }
 
   waspSays(`Server has been deployed at: ${getServerAppUrl(appName)}`);
 }
